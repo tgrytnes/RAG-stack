@@ -21,6 +21,7 @@ ARCHIVE_DIR = Path(os.environ.get("ARCHIVE_DIR", "/app/archive"))
 WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://weaviate:8080")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "llama3.2")
 CLASS_NAME = os.environ.get("WEAVIATE_CLASS", "Document")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
 API_PORT = int(os.environ.get("EMBED_PORT", "8000"))
@@ -68,6 +69,21 @@ def weaviate_search(vec: List[float], top_k: int) -> List[Dict]:
     if resp.status_code != 200:
         raise RuntimeError(f"Weaviate error {resp.status_code}: {resp.text}")
     return resp.json().get("data", {}).get("Get", {}).get(CLASS_NAME, []) or []
+
+
+def map_container_path(path: str) -> str:
+    if not path:
+        return ""
+    mapping = [
+        ("/app/active_docs", "/mnt/sda1/digital_vault/02_active"),
+        ("/app/archive", "/mnt/sda1/digital_vault/03_archive"),
+        ("/app/inbox", "/mnt/sda1/digital_vault/01_inbox"),
+        ("/app/staging", "/mnt/sda1/digital_vault/.staging"),
+    ]
+    for prefix, host in mapping:
+        if path.startswith(prefix):
+            return path.replace(prefix, host, 1)
+    return path
 
 
 def ensure_schema() -> None:
@@ -118,7 +134,7 @@ def upsert_object(obj_id: str, properties: Dict, vector: List[float]) -> None:
         "properties": properties,
         "vector": vector,
     }
-    resp = requests.post(f"{WEAVIATE_URL}/v1/objects", json=payload)
+    resp = requests.put(f"{WEAVIATE_URL}/v1/objects/{obj_id}", json=payload)
     if resp.status_code not in (200, 201):
         raise RuntimeError(f"Failed to upsert object {obj_id}: {resp.status_code} {resp.text}")
 
@@ -268,7 +284,25 @@ def search(req: SearchRequest):
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return {"results": hits}
+    # Enrich hits with host paths and numeric scores.
+    enriched = []
+    for h in hits:
+        add = h.get("_additional", {}) or {}
+        enriched.append(
+            {
+                "score": add.get("score"),
+                "distance": add.get("distance"),
+                "item_type": h.get("item_type"),
+                "source_path": h.get("source_path"),
+                "source_host_path": map_container_path(h.get("source_path", "")),
+                "archived_path": h.get("archived_path"),
+                "archived_host_path": map_container_path(h.get("archived_path", "")),
+                "text": h.get("text", ""),
+                "created_at": h.get("created_at"),
+                "updated_at": h.get("updated_at"),
+            }
+        )
+    return {"results": enriched}
 
 
 @app.get("/v1/models")
@@ -285,18 +319,65 @@ def chat_completions(req: ChatRequest):
     query = user_msgs[-1].content
     try:
         vec = embed_text(query)
-        hits = weaviate_search(vec, req.top_k)
+        hits_raw = weaviate_search(vec, req.top_k)
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc))
 
-    # Format a simple textual response summarizing hits.
-    lines = []
-    for idx, h in enumerate(hits, 1):
+    # Enrich hits.
+    hits = []
+    for h in hits_raw:
         add = h.get("_additional", {}) or {}
-        lines.append(
-            f"{idx}. score={add.get('score')} type={h.get('item_type')} src={h.get('source_path')} text={h.get('text')}"
+        hits.append(
+            {
+                "score": add.get("score"),
+                "distance": add.get("distance"),
+                "item_type": h.get("item_type"),
+                "source_path": h.get("source_path"),
+                "source_host_path": map_container_path(h.get("source_path", "")),
+                "archived_path": h.get("archived_path"),
+                "archived_host_path": map_container_path(h.get("archived_path", "")),
+                "text": h.get("text", ""),
+                "created_at": h.get("created_at"),
+                "updated_at": h.get("updated_at"),
+            }
         )
-    content = "\n".join(lines) if lines else "No results"
+
+    # Build a summary with an LLM if available.
+    summary = "No results"
+    if hits:
+        try:
+            bullet_lines = []
+            for idx, h in enumerate(hits, 1):
+                bullet_lines.append(
+                    f"{idx}) score={h['score']} distance={h['distance']} type={h['item_type']} src={h['source_host_path'] or h['source_path']} text={h['text']}"
+                )
+            prompt = (
+                "You are a helpful assistant summarizing vector search hits.\n"
+                "Given the hits below, produce a short answer to the user's query and list each hit with score and host path.\n"
+                f"User query: {query}\nHits:\n" + "\n".join(bullet_lines)
+            )
+            llm_payload = {
+                "model": CHAT_MODEL,
+                "messages": [
+                    {"role": "system", "content": "Summarize search hits concisely."},
+                    {"role": "user", "content": prompt},
+                ],
+                "stream": False,
+            }
+            llm_resp = requests.post(f"{OLLAMA_URL}/api/chat", json=llm_payload, timeout=60)
+            if llm_resp.status_code == 200:
+                summary = llm_resp.json().get("message", {}).get("content", "") or "\n".join(bullet_lines)
+            else:
+                summary = "\n".join(bullet_lines)
+        except Exception:
+            summary = "\n".join(
+                [
+                    f"{idx}) score={h['score']} distance={h['distance']} type={h['item_type']} src={h['source_host_path'] or h['source_path']}"
+                    for idx, h in enumerate(hits, 1)
+                ]
+            )
+
+    content = summary
     now = int(time.time())
     return {
         "id": f"weaviate-search-{now}",
