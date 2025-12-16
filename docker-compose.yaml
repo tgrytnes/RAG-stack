@@ -1,14 +1,18 @@
-version: "3.9"
-
 services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    container_name: qdrant
+  weaviate:
+    image: semitechnologies/weaviate:latest
+    container_name: weaviate
     restart: unless-stopped
     ports:
-      - "6333:6333"
+      - "8081:8080"
+    environment:
+      - PERSISTENCE_DATA_PATH=/var/lib/weaviate
+      - QUERY_DEFAULTS_LIMIT=25
+      - AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED=true
+      - DEFAULT_VECTORIZER_MODULE=none
+      - CLUSTER_HOSTNAME=node1
     volumes:
-      - /mnt/sda1/digital_vault/.qdrant_data:/qdrant/storage
+      - /mnt/sda1/digital_vault/.weaviate_data:/var/lib/weaviate
 
   etl:
     build:
@@ -16,12 +20,12 @@ services:
     container_name: vault-etl
     restart: unless-stopped
     depends_on:
-      - qdrant
+      - weaviate
     environment:
       - INBOX_DIR=/app/inbox
       - ARCHIVE_DIR=/app/archive
       - STAGING_DIR=/app/staging
-      - QDRANT_URL=http://qdrant:6333
+      - WEAVIATE_URL=http://weaviate:8080
     volumes:
       - /mnt/sda1/digital_vault/01_inbox:/app/inbox
       - /mnt/sda1/digital_vault/03_archive:/app/archive
@@ -33,12 +37,12 @@ services:
     container_name: vault-embedder
     restart: unless-stopped
     depends_on:
-      - qdrant
+      - weaviate
     environment:
       - STAGING_DIR=/app/staging
       - ACTIVE_DIR=/app/active_docs
       - ARCHIVE_DIR=/app/archive
-      - QDRANT_URL=http://qdrant:6333
+      - WEAVIATE_URL=http://weaviate:8080
     volumes:
       - /mnt/sda1/digital_vault/.staging:/app/staging
       - /mnt/sda1/digital_vault/02_active:/app/active_docs:ro
