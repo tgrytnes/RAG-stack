@@ -1,0 +1,45 @@
+version: "3.9"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333"
+    volumes:
+      - /mnt/sda1/digital_vault/.qdrant_data:/qdrant/storage
+
+  etl:
+    build:
+      context: ./etl
+    container_name: vault-etl
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    environment:
+      - INBOX_DIR=/app/inbox
+      - ARCHIVE_DIR=/app/archive
+      - STAGING_DIR=/app/staging
+      - QDRANT_URL=http://qdrant:6333
+    volumes:
+      - /mnt/sda1/digital_vault/01_inbox:/app/inbox
+      - /mnt/sda1/digital_vault/03_archive:/app/archive
+      - /mnt/sda1/digital_vault/.staging:/app/staging
+
+  embedder:
+    build:
+      context: ./embedder
+    container_name: vault-embedder
+    restart: unless-stopped
+    depends_on:
+      - qdrant
+    environment:
+      - STAGING_DIR=/app/staging
+      - ACTIVE_DIR=/app/active_docs
+      - ARCHIVE_DIR=/app/archive
+      - QDRANT_URL=http://qdrant:6333
+    volumes:
+      - /mnt/sda1/digital_vault/.staging:/app/staging
+      - /mnt/sda1/digital_vault/02_active:/app/active_docs:ro
+      - /mnt/sda1/digital_vault/03_archive:/app/archive:ro
