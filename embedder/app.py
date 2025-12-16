@@ -42,6 +42,34 @@ def embed_text(text: str) -> List[float]:
     return vec
 
 
+def weaviate_search(vec: List[float], top_k: int) -> List[Dict]:
+    gql = {
+        "query": f"""
+        {{
+          Get {{
+            {CLASS_NAME}(
+              nearVector: {{vector: {json.dumps(vec)} }}
+              limit: {top_k}
+            ) {{
+              _additional {{ score distance }}
+              text
+              item_type
+              source_path
+              archived_path
+              checksum
+              created_at
+              updated_at
+            }}
+          }}
+        }}
+        """
+    }
+    resp = requests.post(f"{WEAVIATE_URL}/v1/graphql", json=gql)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Weaviate error {resp.status_code}: {resp.text}")
+    return resp.json().get("data", {}).get("Get", {}).get(CLASS_NAME, []) or []
+
+
 def ensure_schema() -> None:
     desired_properties = [
         {"name": "text", "dataType": ["text"]},
@@ -212,51 +240,81 @@ if __name__ == "__main__":
 
     app = FastAPI()
 
-    class SearchRequest(BaseModel):
-        query: str
-        top_k: int = 5
+class SearchRequest(BaseModel):
+    query: str
+    top_k: int = 5
 
-    @app.get("/health")
-    def health():
-        return {"status": "ok", "model": EMBED_MODEL}
 
-    @app.post("/search")
-    def search(req: SearchRequest):
-        try:
-            vec = embed_text(req.query)
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=str(exc))
+class ChatMessage(BaseModel):
+    role: str
+    content: str
 
-        gql = {
-            "query": f"""
-            {{
-              Get {{
-                {CLASS_NAME}(
-                  nearVector: {{vector: {json.dumps(vec)} }}
-                  limit: {req.top_k}
-                ) {{
-                  _additional {{ score distance }}
-                  text
-                  item_type
-                  source_path
-                  archived_path
-                  checksum
-                  created_at
-                  updated_at
-                }}
-              }}
-            }}
-            """
-        }
-        resp = requests.post(f"{WEAVIATE_URL}/v1/graphql", json=gql)
-        if resp.status_code != 200:
-            raise HTTPException(status_code=500, detail=f"Weaviate error {resp.status_code}: {resp.text}")
-        data = resp.json()
-        hits = data.get("data", {}).get("Get", {}).get(CLASS_NAME, []) or []
-        return {"results": hits}
 
-    stop_event = threading.Event()
-    ingestion_thread = threading.Thread(target=main_loop, daemon=True)
-    ingestion_thread.start()
+class ChatRequest(BaseModel):
+    messages: List[ChatMessage]
+    top_k: int = 5
 
-    uvicorn.run(app, host="0.0.0.0", port=API_PORT)
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "model": EMBED_MODEL}
+
+
+@app.post("/search")
+def search(req: SearchRequest):
+    try:
+        vec = embed_text(req.query)
+        hits = weaviate_search(vec, req.top_k)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    return {"results": hits}
+
+
+@app.get("/v1/models")
+def list_models():
+    return {"data": [{"id": "weaviate-search", "object": "model", "owned_by": "local"}]}
+
+
+@app.post("/v1/chat/completions")
+def chat_completions(req: ChatRequest):
+    # Use the last user message as the query.
+    user_msgs = [m for m in req.messages if m.role == "user"]
+    if not user_msgs:
+        raise HTTPException(status_code=400, detail="No user message provided")
+    query = user_msgs[-1].content
+    try:
+        vec = embed_text(query)
+        hits = weaviate_search(vec, req.top_k)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=str(exc))
+
+    # Format a simple textual response summarizing hits.
+    lines = []
+    for idx, h in enumerate(hits, 1):
+        add = h.get("_additional", {}) or {}
+        lines.append(
+            f"{idx}. score={add.get('score')} type={h.get('item_type')} src={h.get('source_path')} text={h.get('text')}"
+        )
+    content = "\n".join(lines) if lines else "No results"
+    now = int(time.time())
+    return {
+        "id": f"weaviate-search-{now}",
+        "object": "chat.completion",
+        "created": now,
+        "model": "weaviate-search",
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": content},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+
+
+stop_event = threading.Event()
+ingestion_thread = threading.Thread(target=main_loop, daemon=True)
+ingestion_thread.start()
+
+uvicorn.run(app, host="0.0.0.0", port=API_PORT)
