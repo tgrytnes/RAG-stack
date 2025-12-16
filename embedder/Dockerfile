@@ -1,4 +1,9 @@
 FROM python:3.11-slim
+
 WORKDIR /app
-# Placeholder image until embedder code is added.
-CMD ["sleep", "infinity"]
+
+RUN pip install --no-cache-dir requests
+
+COPY app.py .
+
+CMD ["python", "app.py"]

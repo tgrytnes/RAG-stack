@@ -14,8 +14,8 @@ Paths
 Compose services (docker-compose.yaml)
 -------------------------------------
 - `weaviate`: database, stores data in `/mnt/sda1/digital_vault/.weaviate_data` (no built-in vectorizer enabled).
-- `etl` (Janitor): watch `01_inbox`, OCR/parse, create `file.json`, move PDF + JSON to `03_archive`, and drop JSON in `.staging`.
-- `embedder` (Librarian): watch `.staging` + `02_active`, embed JSONs and notes, send to Weaviate, delete JSONs from `.staging`; can scan `03_archive` JSONs for disaster recovery.
+- `etl` (Janitor, scaffolded): polls `01_inbox`, moves the original file to `03_archive`, writes a JSON sidecar (stub text/metadata) to `03_archive` and copies it into `.staging` for embedding.
+- `embedder` (Librarian, scaffolded): on a loop, ingests JSONs from `.staging` into Weaviate with a deterministic toy embedding, then deletes the staging JSON; also watches `02_active` (`.md/.txt`) and re-embeds on change.
 
 Run
 ---
