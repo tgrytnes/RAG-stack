@@ -15,19 +15,27 @@ STAGING_DIR = Path(os.environ.get("STAGING_DIR", "/app/staging"))
 ACTIVE_DIR = Path(os.environ.get("ACTIVE_DIR", "/app/active_docs"))
 ARCHIVE_DIR = Path(os.environ.get("ARCHIVE_DIR", "/app/archive"))
 WEAVIATE_URL = os.environ.get("WEAVIATE_URL", "http://weaviate:8080")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
+EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 CLASS_NAME = os.environ.get("WEAVIATE_CLASS", "Document")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
-VECTOR_DIM = int(os.environ.get("VECTOR_DIM", "64"))
+VECTOR_DIM_ENV = os.environ.get("VECTOR_DIM")
 
 
 def iso_now() -> str:
     return datetime.utcnow().isoformat() + "Z"
 
 
-def deterministic_vector(text: str, dim: int) -> List[float]:
-    data = hashlib.sha256(text.encode("utf-8", errors="ignore")).digest()
-    buf = (data * ((dim // len(data)) + 1))[:dim]
-    return [b / 255.0 for b in buf]
+def embed_text(text: str) -> List[float]:
+    payload = {"model": EMBED_MODEL, "input": text}
+    resp = requests.post(f"{OLLAMA_URL}/api/embeddings", json=payload, timeout=60)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Embedding failed: {resp.status_code} {resp.text}")
+    data = resp.json()
+    vec = data.get("embedding")
+    if not isinstance(vec, list):
+        raise RuntimeError(f"Embedding response missing vector: {data}")
+    return vec
 
 
 def ensure_schema() -> None:
@@ -95,6 +103,9 @@ def ingest_json(path: Path) -> None:
         data = json.load(f)
     text = data.get("text", "")
     obj_id = normalize_uuid(data.get("id") or str(path))
+    if not text:
+        print(f"[EMBEDDER] Skipping empty text in {path}")
+        return
     props = {
         "text": text,
         "item_type": data.get("item_type", "unknown"),
@@ -104,7 +115,7 @@ def ingest_json(path: Path) -> None:
         "created_at": data.get("created_at", iso_now()),
         "updated_at": iso_now(),
     }
-    vector = deterministic_vector(text, VECTOR_DIM)
+    vector = embed_text(text)
     upsert_object(obj_id, props, vector)
 
 
@@ -144,7 +155,7 @@ def scan_active_files(state: Dict[str, float]) -> None:
             "created_at": iso_now(),
             "updated_at": iso_now(),
         }
-        vector = deterministic_vector(text, VECTOR_DIM)
+        vector = embed_text(text)
         try:
             upsert_object(obj_id, props, vector)
             state[key] = mtime

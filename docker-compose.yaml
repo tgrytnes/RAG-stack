@@ -43,7 +43,11 @@ services:
       - ACTIVE_DIR=/app/active_docs
       - ARCHIVE_DIR=/app/archive
       - WEAVIATE_URL=http://weaviate:8080
+      - OLLAMA_URL=http://host.docker.internal:11434
+      - EMBED_MODEL=nomic-embed-text
     volumes:
       - /mnt/sda1/digital_vault/.staging:/app/staging
       - /mnt/sda1/digital_vault/02_active:/app/active_docs:ro
       - /mnt/sda1/digital_vault/03_archive:/app/archive:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
