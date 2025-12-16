@@ -14,6 +14,7 @@ import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import uvicorn
+from fastapi.responses import FileResponse
 
 STAGING_DIR = Path(os.environ.get("STAGING_DIR", "/app/staging"))
 ACTIVE_DIR = Path(os.environ.get("ACTIVE_DIR", "/app/active_docs"))
@@ -95,6 +96,7 @@ def ensure_schema() -> None:
         {"name": "checksum", "dataType": ["text"]},
         {"name": "created_at", "dataType": ["text"]},
         {"name": "updated_at", "dataType": ["text"]},
+        {"name": "html_path", "dataType": ["text"]},
     ]
     schema = {
         "class": CLASS_NAME,
@@ -162,6 +164,7 @@ def ingest_json(path: Path) -> None:
         "checksum": data.get("checksum", ""),
         "created_at": data.get("created_at", iso_now()),
         "updated_at": iso_now(),
+        "html_path": data.get("metadata", {}).get("html_path", ""),
     }
     vector = embed_text(text)
     upsert_object(obj_id, props, vector)
@@ -285,18 +288,27 @@ def search(req: SearchRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
     # Enrich hits with host paths and numeric scores.
+    api_base = os.environ.get("API_BASE", "")
     enriched = []
     for h in hits:
         add = h.get("_additional", {}) or {}
+        source_path = h.get("source_path", "")
+        archived_path = h.get("archived_path", "")
+        html_path = h.get("html_path", "")
         enriched.append(
             {
                 "score": add.get("score"),
                 "distance": add.get("distance"),
                 "item_type": h.get("item_type"),
-                "source_path": h.get("source_path"),
-                "source_host_path": map_container_path(h.get("source_path", "")),
-                "archived_path": h.get("archived_path"),
-                "archived_host_path": map_container_path(h.get("archived_path", "")),
+                "source_path": source_path,
+                "source_host_path": map_container_path(source_path),
+                "source_view_url": build_view_url(source_path, api_base),
+                "archived_path": archived_path,
+                "archived_host_path": map_container_path(archived_path),
+                "archived_view_url": build_view_url(archived_path, api_base),
+                "html_path": html_path,
+                "html_host_path": map_container_path(html_path),
+                "html_view_url": build_view_url(html_path, api_base),
                 "text": h.get("text", ""),
                 "created_at": h.get("created_at"),
                 "updated_at": h.get("updated_at"),
@@ -324,18 +336,27 @@ def chat_completions(req: ChatRequest):
         raise HTTPException(status_code=500, detail=str(exc))
 
     # Enrich hits.
+    api_base = os.environ.get("API_BASE", "")
     hits = []
     for h in hits_raw:
         add = h.get("_additional", {}) or {}
+        source_path = h.get("source_path", "")
+        archived_path = h.get("archived_path", "")
+        html_path = h.get("html_path", "")
         hits.append(
             {
                 "score": add.get("score"),
                 "distance": add.get("distance"),
                 "item_type": h.get("item_type"),
-                "source_path": h.get("source_path"),
-                "source_host_path": map_container_path(h.get("source_path", "")),
-                "archived_path": h.get("archived_path"),
-                "archived_host_path": map_container_path(h.get("archived_path", "")),
+                "source_path": source_path,
+                "source_host_path": map_container_path(source_path),
+                "source_view_url": build_view_url(source_path, api_base),
+                "archived_path": archived_path,
+                "archived_host_path": map_container_path(archived_path),
+                "archived_view_url": build_view_url(archived_path, api_base),
+                "html_path": html_path,
+                "html_host_path": map_container_path(html_path),
+                "html_view_url": build_view_url(html_path, api_base),
                 "text": h.get("text", ""),
                 "created_at": h.get("created_at"),
                 "updated_at": h.get("updated_at"),
@@ -349,11 +370,11 @@ def chat_completions(req: ChatRequest):
             bullet_lines = []
             for idx, h in enumerate(hits, 1):
                 bullet_lines.append(
-                    f"{idx}) score={h['score']} distance={h['distance']} type={h['item_type']} src={h['source_host_path'] or h['source_path']} text={h['text']}"
+                    f"{idx}) score={h['score']} distance={h['distance']} type={h['item_type']} src={h['archived_host_path'] or h['source_host_path'] or h['archived_path']} text={h['text']}"
                 )
             prompt = (
                 "You are a helpful assistant summarizing vector search hits.\n"
-                "Given the hits below, produce a short answer to the user's query and list each hit with score and host path.\n"
+                "Given the hits below, produce a short answer to the user's query and list each hit with score, distance, and host path. If an html_view_url is present, present that as the best view link; otherwise prefer archived_view_url, then source_view_url.\n"
                 f"User query: {query}\nHits:\n" + "\n".join(bullet_lines)
             )
             llm_payload = {
@@ -398,4 +419,30 @@ stop_event = threading.Event()
 ingestion_thread = threading.Thread(target=main_loop, daemon=True)
 ingestion_thread.start()
 
+ALLOWED_ROOTS = [
+    Path("/app/archive").resolve(),
+    Path("/app/active_docs").resolve(),
+    Path("/app/inbox").resolve(),
+]
+
+
+@app.get("/file")
+def serve_file(path: str):
+    if not path:
+        raise HTTPException(status_code=400, detail="Missing path")
+    real = Path(path).resolve()
+    if not any(str(real).startswith(str(root)) for root in ALLOWED_ROOTS):
+        raise HTTPException(status_code=403, detail="Forbidden path")
+    if not real.exists() or not real.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(str(real))
+
+
 uvicorn.run(app, host="0.0.0.0", port=API_PORT)
+def build_view_url(path: str, api_base: str) -> str:
+    from urllib.parse import quote
+
+    if not path:
+        return ""
+    encoded = quote(path)
+    return f"{api_base}/file?path={encoded}" if api_base else f"/file?path={encoded}"

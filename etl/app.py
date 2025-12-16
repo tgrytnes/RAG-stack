@@ -77,13 +77,18 @@ def parse_email(src_path: str) -> Dict:
     to = msg.get("to", "")
     date = msg.get("date", "")
     body_parts = []
+    html_parts = []
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_type() == "text/plain":
                 body_parts.append(part.get_content().strip())
+            elif part.get_content_type() == "text/html":
+                html_parts.append(part.get_content())
     else:
         if msg.get_content_type() == "text/plain":
             body_parts.append(msg.get_content().strip())
+        elif msg.get_content_type() == "text/html":
+            html_parts.append(msg.get_content())
     body = "\n".join(body_parts)
     return {
         "subject": subject,
@@ -91,6 +96,7 @@ def parse_email(src_path: str) -> Dict:
         "to": to,
         "date": date,
         "text": body,
+        "html_content": html_parts[0] if html_parts else "",
     }
 
 
@@ -144,6 +150,19 @@ def process_file(src_path: str, rel_dir: str, filename: str) -> None:
     sidecar_name = f"{os.path.splitext(filename)[0]}.json"
     sidecar_archive_path = os.path.join(archive_subdir, sidecar_name)
     sidecar_staging_path = os.path.join(STAGING_DIR, sidecar_name)
+
+    # If email with HTML content, write an .html copy alongside the archive.
+    if ext in EMAIL_EXTS:
+        html_content = meta.get("html_content") or ""
+        if not html_content:
+            # Render plain text into simple HTML
+            import html
+
+            html_content = f"<html><body><pre>{html.escape(text)}</pre></body></html>"
+        html_copy_path = os.path.join(archive_subdir, f"{os.path.splitext(filename)[0]}.html")
+        with open(html_copy_path, "w", encoding="utf-8") as hf:
+            hf.write(html_content)
+        meta["html_path"] = html_copy_path
 
     shutil.move(src_path, archived_path)
     if meta.get("ocr_output") and os.path.exists(meta["ocr_output"]):
