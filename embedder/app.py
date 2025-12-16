@@ -1,7 +1,10 @@
+import argparse
 import hashlib
 import json
 import os
+import sys
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -28,27 +31,43 @@ def deterministic_vector(text: str, dim: int) -> List[float]:
 
 
 def ensure_schema() -> None:
-    existing = requests.get(f"{WEAVIATE_URL}/v1/schema")
-    if existing.status_code == 200:
-        classes = [c.get("class") for c in existing.json().get("classes", [])]
-        if CLASS_NAME in classes:
-            return
+    desired_properties = [
+        {"name": "text", "dataType": ["text"]},
+        {"name": "item_type", "dataType": ["text"]},
+        {"name": "source_path", "dataType": ["text"]},
+        {"name": "archived_path", "dataType": ["text"]},
+        {"name": "checksum", "dataType": ["text"]},
+        {"name": "created_at", "dataType": ["text"]},
+        {"name": "updated_at", "dataType": ["text"]},
+    ]
     schema = {
         "class": CLASS_NAME,
         "vectorizer": "none",
-        "properties": [
-            {"name": "text", "dataType": ["text"]},
-            {"name": "item_type", "dataType": ["text"]},
-            {"name": "source_path", "dataType": ["text"]},
-            {"name": "archived_path", "dataType": ["text"]},
-            {"name": "created_at", "dataType": ["text"]},
-            {"name": "updated_at", "dataType": ["text"]},
-        ],
     }
+    existing = requests.get(f"{WEAVIATE_URL}/v1/schema")
+    if existing.status_code == 200:
+        classes = existing.json().get("classes", [])
+        for c in classes:
+            if c.get("class") == CLASS_NAME:
+                # Add any missing properties one by one.
+                existing_props = {p.get("name") for p in (c.get("properties") or [])}
+                for prop in desired_properties:
+                    if prop["name"] not in existing_props:
+                        add = requests.post(
+                            f"{WEAVIATE_URL}/v1/schema/{CLASS_NAME}/properties",
+                            json=prop,
+                        )
+                        if add.status_code not in (200, 201):
+                            raise RuntimeError(
+                                f"Failed to add property {prop['name']}: {add.status_code} {add.text}"
+                            )
+                return
+    # Class does not exist; create with properties.
+    schema["properties"] = desired_properties
     resp = requests.post(f"{WEAVIATE_URL}/v1/schema", json=schema)
     if resp.status_code not in (200, 201):
         raise RuntimeError(
-            f"Failed to create schema: {resp.status_code} {resp.text}; payload={json.dumps(schema)}"
+            f"Failed to ensure schema: {resp.status_code} {resp.text}; payload={json.dumps(schema)}"
         )
 
 
@@ -64,23 +83,35 @@ def upsert_object(obj_id: str, properties: Dict, vector: List[float]) -> None:
         raise RuntimeError(f"Failed to upsert object {obj_id}: {resp.status_code} {resp.text}")
 
 
-def process_staging_file(path: Path) -> None:
+def normalize_uuid(raw: str) -> str:
+    try:
+        return str(uuid.UUID(str(raw)))
+    except Exception:
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, str(raw)))
+
+
+def ingest_json(path: Path) -> None:
     with path.open("r", encoding="utf-8") as f:
         data = json.load(f)
     text = data.get("text", "")
-    obj_id = data.get("id") or hashlib.sha256(str(path).encode()).hexdigest()
+    obj_id = normalize_uuid(data.get("id") or str(path))
     props = {
         "text": text,
         "item_type": data.get("item_type", "unknown"),
         "source_path": data.get("source_path", ""),
         "archived_path": data.get("archived_path", ""),
+        "checksum": data.get("checksum", ""),
         "created_at": data.get("created_at", iso_now()),
         "updated_at": iso_now(),
     }
     vector = deterministic_vector(text, VECTOR_DIM)
     upsert_object(obj_id, props, vector)
+
+
+def process_staging_file(path: Path) -> None:
+    ingest_json(path)
     path.unlink()
-    print(f"[EMBEDDER] Ingested staging {path.name} -> Weaviate id={obj_id}")
+    print(f"[EMBEDDER] Ingested staging {path.name}")
 
 
 def scan_staging() -> None:
@@ -103,12 +134,13 @@ def scan_active_files(state: Dict[str, float]) -> None:
             continue
         with path.open("r", encoding="utf-8") as f:
             text = f.read()
-        obj_id = hashlib.sha256(key.encode()).hexdigest()
+        obj_id = normalize_uuid(key)
         props = {
             "text": text,
             "item_type": "active",
             "source_path": key,
             "archived_path": "",
+            "checksum": "",
             "created_at": iso_now(),
             "updated_at": iso_now(),
         }
@@ -121,7 +153,18 @@ def scan_active_files(state: Dict[str, float]) -> None:
             print(f"[EMBEDDER] Failed active file {path}: {exc}")
 
 
-def main() -> None:
+def reindex_archive(archive_dir: Path) -> None:
+    count = 0
+    for path in archive_dir.rglob("*.json"):
+        try:
+            ingest_json(path)
+            count += 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"[EMBEDDER] Failed archive JSON {path}: {exc}")
+    print(f"[EMBEDDER] Reindex complete. Loaded {count} JSON sidecars from archive.")
+
+
+def main_loop() -> None:
     print(f"[EMBEDDER] Connecting to Weaviate at {WEAVIATE_URL}, class={CLASS_NAME}")
     ensure_schema()
     os.makedirs(STAGING_DIR, exist_ok=True)
@@ -133,5 +176,22 @@ def main() -> None:
         time.sleep(POLL_INTERVAL)
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Embedder service for Digital Vault.")
+    parser.add_argument(
+        "--reindex",
+        dest="reindex",
+        nargs="?",
+        const=str(ARCHIVE_DIR),
+        help="Reindex all JSON sidecars from archive (default: /app/archive).",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    if args.reindex:
+        ensure_schema()
+        reindex_archive(Path(args.reindex))
+        sys.exit(0)
+    main_loop()

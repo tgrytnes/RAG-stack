@@ -14,8 +14,8 @@ Paths
 Compose services (docker-compose.yaml)
 -------------------------------------
 - `weaviate`: database, stores data in `/mnt/sda1/digital_vault/.weaviate_data` (no built-in vectorizer enabled).
-- `etl` (Janitor, scaffolded): polls `01_inbox`, moves the original file to `03_archive`, writes a JSON sidecar (stub text/metadata) to `03_archive` and copies it into `.staging` for embedding.
-- `embedder` (Librarian, scaffolded): on a loop, ingests JSONs from `.staging` into Weaviate with a deterministic toy embedding, then deletes the staging JSON; also watches `02_active` (`.md/.txt`) and re-embeds on change.
+- `etl` (Janitor, scaffolded): polls `01_inbox`, OCRs/extracts text (ocrmypdf+pdfplumber for PDFs, pytesseract for images, text read for md/txt, basic email parse for .eml), moves the original file to `03_archive`, writes a JSON sidecar with metadata/UUID/checksum to `03_archive` and copies it into `.staging` for embedding.
+- `embedder` (Librarian, scaffolded): on a loop, ingests JSONs from `.staging` into Weaviate with a deterministic toy embedding, then deletes the staging JSON; also watches `02_active` (`.md/.txt`) and re-embeds on change. Provides `--reindex` to reload all sidecars from archive.
 
 Run
 ---
@@ -24,6 +24,15 @@ cd ~/projects/RAG-stack
 docker compose up -d --build
 ```
 Weaviate: `http://<pi-ip>:8081` (GraphQL/REST endpoints).
+
+Reindex (disaster recovery)
+---------------------------
+If Weaviate data corrupts: stop the stack, clear `.weaviate_data`, `docker compose up -d`, then:
+```bash
+cd ~/projects/RAG-stack
+docker compose exec embedder python app.py --reindex /app/archive
+```
+This reads all JSON sidecars from archive and re-ingests them without re-OCRing.
 
 Disaster recovery
 -----------------
