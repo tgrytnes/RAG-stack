@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -10,6 +11,9 @@ from pathlib import Path
 from typing import Dict, List
 
 import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import uvicorn
 
 STAGING_DIR = Path(os.environ.get("STAGING_DIR", "/app/staging"))
 ACTIVE_DIR = Path(os.environ.get("ACTIVE_DIR", "/app/active_docs"))
@@ -19,7 +23,7 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://host.docker.internal:11434")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "nomic-embed-text")
 CLASS_NAME = os.environ.get("WEAVIATE_CLASS", "Document")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "5"))
-VECTOR_DIM_ENV = os.environ.get("VECTOR_DIM")
+API_PORT = int(os.environ.get("EMBED_PORT", "8000"))
 
 
 def iso_now() -> str:
@@ -205,4 +209,54 @@ if __name__ == "__main__":
         ensure_schema()
         reindex_archive(Path(args.reindex))
         sys.exit(0)
-    main_loop()
+
+    app = FastAPI()
+
+    class SearchRequest(BaseModel):
+        query: str
+        top_k: int = 5
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok", "model": EMBED_MODEL}
+
+    @app.post("/search")
+    def search(req: SearchRequest):
+        try:
+            vec = embed_text(req.query)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        gql = {
+            "query": f"""
+            {{
+              Get {{
+                {CLASS_NAME}(
+                  nearVector: {{vector: {json.dumps(vec)} }}
+                  limit: {req.top_k}
+                ) {{
+                  _additional {{ score distance }}
+                  text
+                  item_type
+                  source_path
+                  archived_path
+                  checksum
+                  created_at
+                  updated_at
+                }}
+              }}
+            }}
+            """
+        }
+        resp = requests.post(f"{WEAVIATE_URL}/v1/graphql", json=gql)
+        if resp.status_code != 200:
+            raise HTTPException(status_code=500, detail=f"Weaviate error {resp.status_code}: {resp.text}")
+        data = resp.json()
+        hits = data.get("data", {}).get("Get", {}).get(CLASS_NAME, []) or []
+        return {"results": hits}
+
+    stop_event = threading.Event()
+    ingestion_thread = threading.Thread(target=main_loop, daemon=True)
+    ingestion_thread.start()
+
+    uvicorn.run(app, host="0.0.0.0", port=API_PORT)

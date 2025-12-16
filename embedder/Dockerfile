@@ -4,7 +4,7 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir requests
+RUN pip install --no-cache-dir requests fastapi uvicorn
 
 COPY app.py .
 
